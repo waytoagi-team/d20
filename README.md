@@ -23,3 +23,6 @@ WaytoAGI 在 D20 全球设计院长峰会使用的动态网页演示稿。
 
 [D20.waytoagi.com](https://d20.waytoagi.com)
 
+## 部署
+
+项目无需构建，生产环境通过 GitHub Actions 同步到阿里云 OSS。配置方法见 [DEPLOYMENT.md](./DEPLOYMENT.md)。

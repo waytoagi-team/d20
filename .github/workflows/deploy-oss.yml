@@ -1,0 +1,235 @@
+name: Deploy static site to OSS
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - index.html
+      - assets/**
+      - .github/workflows/deploy-oss.yml
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview the OSS changes without uploading or deleting objects
+        required: true
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: d20-oss-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.OSS_DEPLOY_ENABLED == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: production
+    env:
+      OSS_ACCESS_KEY_ID: ${{ secrets.OSS_ACCESS_KEY_ID }}
+      OSS_ACCESS_KEY_SECRET: ${{ secrets.OSS_ACCESS_KEY_SECRET }}
+      OSS_REGION: ${{ vars.OSS_REGION }}
+      OSS_ENDPOINT: ${{ vars.OSS_ENDPOINT }}
+      OSS_ADDRESSING_STYLE: ${{ vars.OSS_ADDRESSING_STYLE || 'virtual' }}
+      OSS_BUCKET: ${{ vars.OSS_BUCKET }}
+      OSS_ORIGIN_URL: ${{ vars.OSS_ORIGIN_URL }}
+      BEFORE_SHA: ${{ github.event.before }}
+      MANUAL_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate deployment configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for name in OSS_ACCESS_KEY_ID OSS_ACCESS_KEY_SECRET OSS_REGION OSS_ENDPOINT OSS_BUCKET; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::${name} is not configured for the production environment"
+              missing=1
+            fi
+          done
+          if (( missing )); then
+            exit 1
+          fi
+
+          if [[ ! "${OSS_BUCKET}" =~ ^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$ ]]; then
+            echo "::error::OSS_BUCKET is not a valid OSS bucket name"
+            exit 1
+          fi
+          if [[ ! "${OSS_REGION}" =~ ^[a-z0-9-]+$ ]]; then
+            echo "::error::OSS_REGION is not a valid region ID"
+            exit 1
+          fi
+          if [[ -n "${OSS_ENDPOINT:-}" && ! "${OSS_ENDPOINT}" =~ ^https:// ]]; then
+            echo "::error::OSS_ENDPOINT must use HTTPS"
+            exit 1
+          fi
+          if [[ ! "${OSS_ADDRESSING_STYLE}" =~ ^(virtual|path|cname)$ ]]; then
+            echo "::error::OSS_ADDRESSING_STYLE must be virtual, path, or cname"
+            exit 1
+          fi
+
+      - name: Prepare static site
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf .deploy
+          mkdir -p .deploy
+          install -m 0644 index.html .deploy/index.html
+          cp -a assets .deploy/assets
+
+          if [[ -n "$(find .deploy -type l -print -quit)" ]]; then
+            echo "::error::The deploy directory must not contain symbolic links"
+            exit 1
+          fi
+
+          file_count="$(find .deploy -type f | wc -l | tr -d ' ')"
+          total_bytes="$(du -sb .deploy | cut -f1)"
+          {
+            echo "### Static site payload"
+            echo
+            echo "- Files: ${file_count}"
+            echo "- Bytes: ${total_bytes}"
+            echo "- Dry run: ${MANUAL_DRY_RUN}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install ossutil 2.3.0
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive="${RUNNER_TEMP}/ossutil-2.3.0-linux-amd64.zip"
+          curl --proto '=https' --tlsv1.2 --retry 3 --retry-all-errors \
+            -fsSLo "${archive}" \
+            https://gosspublic.alicdn.com/ossutil/v2/2.3.0/ossutil-2.3.0-linux-amd64.zip
+          echo "3ae4d9fc85a7a6e9f5654d1599766f1a3a42a3692870887b5ae9338d582ef65a  ${archive}" \
+            | sha256sum -c -
+
+          unzip -q "${archive}" -d "${RUNNER_TEMP}"
+          mkdir -p "${RUNNER_TEMP}/bin"
+          install -m 0755 \
+            "${RUNNER_TEMP}/ossutil-2.3.0-linux-amd64/ossutil" \
+            "${RUNNER_TEMP}/bin/ossutil"
+          echo "${RUNNER_TEMP}/bin" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/bin/ossutil" version
+
+      - name: Upload static assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          common_flags=(
+            --force
+            --no-progress
+            --addressing-style "${OSS_ADDRESSING_STYLE}"
+            --cache-control "public,max-age=86400"
+          )
+
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            flags=("${common_flags[@]}")
+            if [[ "${MANUAL_DRY_RUN}" == "true" ]]; then
+              flags+=(--dry-run)
+            fi
+            ossutil sync \
+              .deploy/assets/ \
+              "oss://${OSS_BUCKET}/assets/" \
+              "${flags[@]}"
+            exit 0
+          fi
+
+          changed_assets="${RUNNER_TEMP}/changed-assets"
+          : > "${changed_assets}"
+          if [[ "${BEFORE_SHA:-}" =~ ^[0-9a-f]{40}$ && ! "${BEFORE_SHA}" =~ ^0+$ ]]; then
+            if git fetch --no-tags --depth=1 origin "${BEFORE_SHA}"; then
+              git diff --name-only --diff-filter=ACMRT -z \
+                "${BEFORE_SHA}" "${GITHUB_SHA}" -- assets/ > "${changed_assets}"
+            else
+              echo "::warning::Could not fetch the previous commit; uploading all assets"
+              find assets -type f -print0 > "${changed_assets}"
+            fi
+          else
+            echo "::warning::No usable previous commit; uploading all assets"
+            find assets -type f -print0 > "${changed_assets}"
+          fi
+
+          upload_count=0
+          while IFS= read -r -d '' asset; do
+            if [[ "${asset}" != assets/* || ! -f "${asset}" || -L "${asset}" ]]; then
+              echo "::error::Refusing unsafe asset path: ${asset}"
+              exit 1
+            fi
+            ossutil cp \
+              "${asset}" \
+              "oss://${OSS_BUCKET}/${asset}" \
+              "${common_flags[@]}"
+            upload_count=$((upload_count + 1))
+          done < "${changed_assets}"
+
+          echo "Uploaded ${upload_count} changed asset(s)."
+
+      - name: Upload index document
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flags=(
+            --force
+            --no-progress
+            --addressing-style "${OSS_ADDRESSING_STYLE}"
+            --cache-control "no-cache, no-store, must-revalidate"
+            --content-type "text/html; charset=utf-8"
+          )
+          if [[ "${MANUAL_DRY_RUN}" == "true" ]]; then
+            flags+=(--dry-run)
+          fi
+
+          ossutil cp \
+            .deploy/index.html \
+            "oss://${OSS_BUCKET}/index.html" \
+            "${flags[@]}"
+
+      - name: Verify origin payload
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.dry_run) }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${OSS_ORIGIN_URL:-}" ]]; then
+            echo "OSS_ORIGIN_URL is not configured; skipping origin size verification."
+            exit 0
+          fi
+
+          headers="$(mktemp)"
+          curl --proto '=https' --tlsv1.2 --retry 5 --retry-all-errors \
+            -fsS --range 0-0 -D "${headers}" -o /dev/null \
+            "${OSS_ORIGIN_URL%/}/index.html"
+
+          local_size="$(stat -c '%s' .deploy/index.html)"
+          remote_size="$(awk 'tolower($1) == "content-range:" { gsub("\\r", "", $3); sub(".*/", "", $3); print $3 }' "${headers}" | tail -n1)"
+          if [[ -z "${remote_size}" ]]; then
+            remote_size="$(awk 'tolower($1) == "content-length:" { gsub("\\r", "", $2); print $2 }' "${headers}" | tail -n1)"
+          fi
+          if [[ "${remote_size}" != "${local_size}" ]]; then
+            echo "::error::Origin index.html is ${remote_size:-unknown} bytes; expected ${local_size}"
+            exit 1
+          fi
+
+          echo "Origin index.html verified at ${local_size} bytes."
+          {
+            echo
+            echo "### Origin verification"
+            echo
+            echo "- index.html: ${local_size} bytes"
+            echo "- CDN cache purge is still required after a production deployment."
+          } >> "${GITHUB_STEP_SUMMARY}"

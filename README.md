@@ -21,8 +21,12 @@ WaytoAGI 在 D20 全球设计院长峰会使用的动态网页演示稿。
 
 ## 在线地址
 
-[D20.waytoagi.com](https://d20.waytoagi.com)
+[www.waytoagi.com/d20/](https://www.waytoagi.com/d20/)
+
+旧域名 `http(s)://d20.waytoagi.com/` 重定向到新路径，历史资源路径与查询参数继续保留。
 
 ## 部署
 
-项目无需构建，生产环境通过 GitHub Actions 同步到阿里云 OSS。配置方法见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
+项目无需构建，由 [waytoagi-static-pages](https://github.com/waytoagi-team/waytoagi-static-pages) 的 `mounts.yaml` 固定本仓库 commit，发布到统一 EdgeOne Pages。视频自动进入共享 OSS 媒体通道。
+
+页面变更合入本仓库后，合并统一仓库对应的版本更新 PR 才会发布；旧 OSS 自动发布已关闭。更新和回退步骤见 [DEPLOYMENT.md](./DEPLOYMENT.md)。
